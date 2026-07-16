@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -5,6 +6,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -20,9 +24,10 @@ constexpr uint32_t MAX_NAME_LEN   = 32;
 constexpr uint32_t MIN_ALIGNMENT  = 0x800;
 constexpr uint32_t DATA_ALIGNMENT = 0x800;
 
-// ---------------------------------------------------------------------------
-// Little-endian read helpers
-// ---------------------------------------------------------------------------
+// ===================================================================
+// Little-endian I/O
+// ===================================================================
+
 static uint32_t read_u32_le(const uint8_t *p) {
     return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
 }
@@ -38,9 +43,39 @@ static T read_le(std::ifstream &f) {
     return v;
 }
 
-// ---------------------------------------------------------------------------
-// Entry record from the file
-// ---------------------------------------------------------------------------
+static void write_u32_le(std::ostream &out, uint32_t v) {
+    out.put(static_cast<unsigned char>(v & 0xFF));
+    out.put(static_cast<unsigned char>((v >> 8) & 0xFF));
+    out.put(static_cast<unsigned char>((v >> 16) & 0xFF));
+    out.put(static_cast<unsigned char>((v >> 24) & 0xFF));
+}
+
+static void write_u16_le(std::ostream &out, uint16_t v) {
+    out.put(static_cast<unsigned char>(v & 0xFF));
+    out.put(static_cast<unsigned char>((v >> 8) & 0xFF));
+}
+
+static uint32_t pad(uint32_t v, uint32_t align) {
+    uint32_t mod = v % align;
+    return mod ? v + (align - mod) : v;
+}
+
+static void fill_zeroes(std::ostream &out, uint32_t count) {
+    std::vector<char> z(count, 0);
+    out.write(z.data(), count);
+}
+
+// ===================================================================
+// Entry / archive descriptors
+// ===================================================================
+
+struct SourceEntry {
+    std::string file_name;   // name on disk (e.g. "hello.txt")
+    std::string entry_name;  // 32-char name inside AFS
+    uint32_t custom_data = 0;
+    bool is_null = false;
+};
+
 struct EntryInfo {
     uint32_t offset = 0;
     uint32_t size   = 0;
@@ -50,22 +85,186 @@ struct EntryInfo {
     bool is_null = false;
 };
 
-// ---------------------------------------------------------------------------
-// AFS archive (in-memory descriptors)
-// ---------------------------------------------------------------------------
 struct AFSArchive {
-    std::string magic_label;       // "AFS_00" or "AFS_20"
+    std::string magic_label;
     uint32_t entry_count = 0;
     uint32_t entry_block_alignment = MIN_ALIGNMENT;
-    std::string attr_info_label;   // "NoAttributes", "InfoAtBeginning", "InfoAtEnd"
+    std::string attr_info_label;
     bool has_attributes = false;
     std::vector<EntryInfo> entries;
     std::string file_path;
 };
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
+// ===================================================================
+// Minimal JSON parser for AFS metadata (zero dependencies)
+// ===================================================================
+
+enum class JType { Null, Bool, Number, String, Array, Object };
+
+struct JValue {
+    JType type = JType::Null;
+    bool    b = false;
+    double  n = 0;
+    std::string s;
+    std::vector<JValue> arr;
+    std::map<std::string, JValue> obj;
+
+    bool is_null()   const { return type == JType::Null; }
+    bool is_bool()   const { return type == JType::Bool; }
+    bool is_number() const { return type == JType::Number; }
+    bool is_string() const { return type == JType::String; }
+    bool is_array()  const { return type == JType::Array; }
+    bool is_object() const { return type == JType::Object; }
+
+    int    as_int()    const { return static_cast<int>(n); }
+    bool   as_bool()   const { return b; }
+    const std::string& as_string() const { return s; }
+
+    const JValue& operator[](const std::string &key) const {
+        static const JValue nul;
+        auto it = obj.find(key);
+        return it != obj.end() ? it->second : nul;
+    }
+
+    const JValue& operator[](size_t i) const {
+        static const JValue nul;
+        return i < arr.size() ? arr[i] : nul;
+    }
+
+    size_t size() const { return arr.size(); }
+
+    // Typed accessors with defaults (for metadata fields)
+    const std::string& str(const std::string &key, const std::string &def = {}) const {
+        auto &v = (*this)[key];
+        return v.is_string() ? v.s : def;
+    }
+    int num(const std::string &key, int def = 0) const {
+        auto &v = (*this)[key];
+        return v.is_number() ? v.as_int() : def;
+    }
+    bool flag(const std::string &key, bool def = false) const {
+        auto &v = (*this)[key];
+        return v.is_bool() ? v.b : def;
+    }
+};
+
+struct JParser {
+    std::istream *in = nullptr;
+
+    char peek() { return static_cast<char>(in->peek()); }
+    char next() { return static_cast<char>(in->get()); }
+    bool done() { return in->eof() || in->fail(); }
+
+    void skip_ws() {
+        while (!done()) {
+            char c = peek();
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') next();
+            else break;
+        }
+    }
+
+    JValue value() {
+        skip_ws();
+        if (done()) return {};
+        char c = peek();
+        if (c == '"') return string_val();
+        if (c == '{') return object();
+        if (c == '[') return array();
+        if (c == 't' || c == 'f') return boolean();
+        if (c == 'n') return null_val();
+        return number();
+    }
+
+    JValue string_val() {
+        JValue v; v.type = JType::String;
+        next(); // opening "
+        while (!done()) {
+            char c = next();
+            if (c == '"') break;
+            if (c == '\\') {
+                switch (next()) {
+                    case '"':  v.s += '"';  break;
+                    case '\\': v.s += '\\'; break;
+                    case '/':  v.s += '/';  break;
+                    case 'n':  v.s += '\n'; break;
+                    case 't':  v.s += '\t'; break;
+                    case 'r':  v.s += '\r'; break;
+                    default: break;
+                }
+            } else {
+                v.s += c;
+            }
+        }
+        return v;
+    }
+
+    JValue number() {
+        JValue v; v.type = JType::Number;
+        std::string num;
+        while (!done()) {
+            char c = peek();
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+                num += next();
+            else break;
+        }
+        v.n = std::stod(num);
+        return v;
+    }
+
+    JValue boolean() {
+        JValue v; v.type = JType::Bool;
+        if (peek() == 't') { next(); next(); next(); next(); v.b = true; }
+        else               { next(); next(); next(); next(); next(); v.b = false; }
+        return v;
+    }
+
+    JValue null_val() {
+        next(); next(); next(); next(); // null
+        return {};
+    }
+
+    JValue object() {
+        JValue v; v.type = JType::Object;
+        next(); // {
+        skip_ws();
+        if (peek() == '}') { next(); return v; }
+        while (true) {
+            skip_ws();
+            JValue key = string_val();
+            skip_ws();
+            if (peek() == ':') next();
+            v.obj[key.s] = value();
+            skip_ws();
+            if (peek() == '}') { next(); break; }
+            if (peek() == ',') next();
+        }
+        return v;
+    }
+
+    JValue array() {
+        JValue v; v.type = JType::Array;
+        next(); // [
+        skip_ws();
+        if (peek() == ']') { next(); return v; }
+        while (true) {
+            v.arr.push_back(value());
+            skip_ws();
+            if (peek() == ']') { next(); break; }
+            if (peek() == ',') next();
+        }
+        return v;
+    }
+};
+
+static JValue parse_json(std::istream &in) {
+    JParser p; p.in = &in;
+    return p.value();
+}
+
+// ===================================================================
+// Sanitize a name for the filesystem
+// ===================================================================
+
 static std::string null_terminated(const uint8_t *buf, size_t maxlen) {
     size_t len = 0;
     while (len < maxlen && buf[len] != 0) ++len;
@@ -77,7 +276,6 @@ static std::string sanitize_name(const std::string &raw) {
     std::string out;
     for (char c : raw) {
         if (c == '\0') break;
-        // strip characters that are problematic on any platform
         if (c == '<' || c == '>' || c == ':' || c == '"' ||
             c == '/' || c == '\\' || c == '|' || c == '?' || c == '*')
             continue;
@@ -87,9 +285,10 @@ static std::string sanitize_name(const std::string &raw) {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Load AFS archive and parse headers (does not copy entry data into memory)
-// ---------------------------------------------------------------------------
+// ===================================================================
+// Load AFS archive from file
+// ===================================================================
+
 static bool load_afs(const std::string &path, AFSArchive &afs) {
     afs.file_path = path;
 
@@ -99,7 +298,6 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         return false;
     }
 
-    // --- header ---
     uint32_t magic = read_le<uint32_t>(f);
     if (magic == AFS_MAGIC_00) {
         afs.magic_label = "AFS_00";
@@ -117,7 +315,6 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         return true;
     }
 
-    // --- entry info block ---
     afs.entries.resize(afs.entry_count);
     uint32_t first_offset = 0, last_end = 0;
     for (uint32_t i = 0; i < afs.entry_count; ++i) {
@@ -131,13 +328,11 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         }
     }
 
-    // --- calculate entry block alignment ---
     uint32_t end_of_info = HEADER_SIZE + afs.entry_count * ENTRY_INFO_SZ + ATTR_INFO_SZ;
     uint32_t alignment = MIN_ALIGNMENT;
     while (end_of_info + alignment < first_offset) alignment <<= 1;
     afs.entry_block_alignment = alignment;
 
-    // --- attribute info (try at-beginning location first) ---
     afs.has_attributes = false;
     afs.attr_info_label = "NoAttributes";
 
@@ -159,7 +354,6 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         afs.has_attributes = true;
         afs.attr_info_label = "InfoAtBeginning";
     } else {
-        // try at-end location
         f.seekg(first_offset - ATTR_INFO_SZ);
         attr_offset = read_le<uint32_t>(f);
         attr_size   = read_le<uint32_t>(f);
@@ -169,7 +363,6 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         }
     }
 
-    // --- read attribute data ---
     if (afs.has_attributes) {
         f.seekg(attr_offset);
         std::vector<uint8_t> attr_buf(attr_size);
@@ -191,7 +384,6 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
             p += ATTR_ELEM_SZ;
         }
     } else {
-        // no attributes: generate numbered names
         for (uint32_t i = 0; i < afs.entry_count; ++i) {
             char buf[16];
             snprintf(buf, sizeof(buf), "%08u", i);
@@ -202,16 +394,16 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 // Extract all entries
-// ---------------------------------------------------------------------------
+// ===================================================================
+
 static bool extract_all(const AFSArchive &afs, const std::string &out_dir) {
     std::ifstream f(afs.file_path, std::ios::binary);
     if (!f) return false;
 
     fs::create_directories(out_dir);
 
-    // detect and resolve duplicate sanitized names
     std::vector<std::string> out_names;
     out_names.reserve(afs.entry_count);
     for (const auto &e : afs.entries) {
@@ -255,22 +447,16 @@ static bool extract_all(const AFSArchive &afs, const std::string &out_dir) {
             return false;
         }
         out.write(reinterpret_cast<const char *>(buf.data()), e.size);
-        out.close();
-
-        // restore timestamp if available
-        if (afs.has_attributes && (e.year != 0 || e.month != 0)) {
-            // best-effort: no standard C++ way to set file times portably
-            // on Linux/macOS we could use utimes, but skip for simplicity
-        }
     }
 
     std::cout << "Extracted " << afs.entry_count << " entries to " << out_dir << "\n";
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Save metadata JSON (for re-packing compatibility)
-// ---------------------------------------------------------------------------
+// ===================================================================
+// Save metadata JSON
+// ===================================================================
+
 static void save_metadata(const AFSArchive &afs, const std::string &meta_path) {
     std::ofstream m(meta_path);
     if (!m) return;
@@ -301,9 +487,224 @@ static void save_metadata(const AFSArchive &afs, const std::string &meta_path) {
     std::cout << "Metadata saved to " << meta_path << "\n";
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
+// Create AFS archive
+// ===================================================================
+
+static bool create_afs(const std::string &input_dir, const std::string &output_path) {
+    std::string meta_path = input_dir + ".json";
+    std::vector<SourceEntry> source;
+    std::string magic_label = "AFS_00";
+    std::string attr_mode   = "InfoAtBeginning";
+    uint32_t entry_block_align = MIN_ALIGNMENT;
+
+    // ---- load metadata if present ----
+    if (fs::exists(meta_path)) {
+        std::ifstream mf(meta_path);
+        if (!mf) {
+            std::cerr << "Warning: cannot read metadata \"" << meta_path << "\", using defaults.\n";
+        } else {
+            JValue root = parse_json(mf);
+            if (root.is_object()) {
+                std::string mt = root.str("HeaderMagicType");
+                if (mt == "AFS_20") magic_label = "AFS_20";
+                else if (mt == "AFS_00" || mt.empty()) magic_label = "AFS_00";
+
+                std::string at = root.str("AttributesInfoType");
+                if (at == "InfoAtEnd")      attr_mode = "InfoAtEnd";
+                else if (at == "NoAttributes") attr_mode = "NoAttributes";
+                else                        attr_mode = "InfoAtBeginning";
+
+                int al = root.num("EntryBlockAlignment");
+                if (al > 0) entry_block_align = std::max(static_cast<uint32_t>(al), MIN_ALIGNMENT);
+
+                const JValue &entries = root["Entries"];
+                if (entries.is_array() && entries.size() > 0) {
+                    for (size_t i = 0; i < entries.size(); ++i) {
+                        const JValue &je = entries[i];
+                        SourceEntry se;
+                        se.is_null = je.flag("IsNull");
+                        se.entry_name = je.str("Name");
+                        se.file_name  = je.str("FileName");
+                        se.custom_data = static_cast<uint32_t>(je.num("CustomData"));
+                        source.push_back(std::move(se));
+                    }
+                }
+            }
+            std::cout << "Loaded metadata: " << source.size() << " entries, "
+                      << magic_label << ", " << attr_mode
+                      << ", alignment=0x" << std::hex << entry_block_align << std::dec << "\n";
+        }
+    }
+
+    // ---- if no metadata entries, scan directory ----
+    if (source.empty()) {
+        std::cout << "No metadata found, scanning directory for files...\n";
+        std::vector<fs::path> files;
+        for (const auto &de : fs::directory_iterator(input_dir)) {
+            if (de.is_regular_file()) files.push_back(de.path());
+        }
+        std::sort(files.begin(), files.end());
+        for (const auto &fp : files) {
+            SourceEntry se;
+            se.file_name = fp.filename().string();
+            se.entry_name = se.file_name;
+            if (se.entry_name.size() > MAX_NAME_LEN) {
+                std::string ext = fp.extension().string();
+                se.entry_name = se.entry_name.substr(0, MAX_NAME_LEN - ext.size()) + ext;
+                std::cout << "Warning: \"" << se.file_name << "\" truncated to \"" << se.entry_name << "\"\n";
+            }
+            se.custom_data = static_cast<uint32_t>(fs::file_size(fp));
+            source.push_back(std::move(se));
+        }
+    }
+
+    if (source.empty()) {
+        std::cerr << "Error: no entries to pack.\n";
+        return false;
+    }
+
+    // ---- read all file data into memory ----
+    std::vector<std::vector<uint8_t>> file_data(source.size());
+    for (size_t i = 0; i < source.size(); ++i) {
+        const auto &se = source[i];
+        if (se.is_null) continue;
+
+        fs::path file_path = fs::path(input_dir) / se.file_name;
+        uint64_t fsize = fs::file_size(file_path);
+        file_data[i].resize(fsize);
+        std::ifstream fin(file_path, std::ios::binary);
+        if (!fin) {
+            std::cerr << "Error: cannot read \"" << file_path << "\"\n";
+            return false;
+        }
+        fin.read(reinterpret_cast<char *>(file_data[i].data()), fsize);
+    }
+
+    // ---- calculate offsets ----
+    uint32_t entry_count = static_cast<uint32_t>(source.size());
+    uint32_t first_entry_offset = pad(HEADER_SIZE + entry_count * ENTRY_INFO_SZ + ATTR_INFO_SZ, entry_block_align);
+
+    std::vector<uint32_t> offsets(entry_count);
+    std::vector<uint32_t> sizes(entry_count);
+
+    uint32_t next = first_entry_offset;
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        if (source[i].is_null) {
+            offsets[i] = 0;
+            sizes[i] = 0;
+        } else {
+            offsets[i] = next;
+            sizes[i] = static_cast<uint32_t>(file_data[i].size());
+            next = pad(next + sizes[i], DATA_ALIGNMENT);
+        }
+    }
+
+    uint32_t attr_offset = next;
+    bool has_attr = (attr_mode != "NoAttributes");
+    uint32_t attr_size = has_attr ? entry_count * ATTR_ELEM_SZ : 0;
+    uint32_t eof = has_attr ? pad(attr_offset + attr_size, DATA_ALIGNMENT)
+                            : pad(attr_offset, DATA_ALIGNMENT);
+
+    // ---- write ----
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out) {
+        std::cerr << "Error: cannot create \"" << output_path << "\"\n";
+        return false;
+    }
+
+    // header
+    uint32_t magic = (magic_label == "AFS_20") ? AFS_MAGIC_20 : AFS_MAGIC_00;
+    write_u32_le(out, magic);
+    write_u32_le(out, entry_count);
+
+    // entry info block
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        write_u32_le(out, offsets[i]);
+        write_u32_le(out, sizes[i]);
+    }
+
+    // attributes info (at beginning or end)
+    uint32_t pos_after_entries = HEADER_SIZE + entry_count * ENTRY_INFO_SZ;
+    uint32_t gap_to_data = first_entry_offset - (pos_after_entries + ATTR_INFO_SZ);
+
+    if (has_attr && attr_mode == "InfoAtBeginning") {
+        write_u32_le(out, attr_offset);
+        write_u32_le(out, attr_size);
+        fill_zeroes(out, gap_to_data);
+    } else if (has_attr && attr_mode == "InfoAtEnd") {
+        fill_zeroes(out, gap_to_data);
+        write_u32_le(out, attr_offset);
+        write_u32_le(out, attr_size);
+    } else {
+        write_u32_le(out, 0);
+        write_u32_le(out, 0);
+        fill_zeroes(out, gap_to_data);
+    }
+
+    // entry data
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        if (source[i].is_null) {
+            std::cout << "[" << (i + 1) << "/" << entry_count << "] Null entry\n";
+            continue;
+        }
+        std::cout << "[" << (i + 1) << "/" << entry_count
+                  << "] Writing: " << source[i].entry_name
+                  << " (" << sizes[i] << " bytes)\n";
+
+        out.seekp(offsets[i]);
+        out.write(reinterpret_cast<const char *>(file_data[i].data()), sizes[i]);
+    }
+
+    // attribute data
+    if (has_attr) {
+        out.seekp(attr_offset);
+        for (uint32_t i = 0; i < entry_count; ++i) {
+            if (source[i].is_null) {
+                fill_zeroes(out, ATTR_ELEM_SZ);
+            } else {
+                std::string name = source[i].entry_name;
+                if (name.size() > MAX_NAME_LEN) name = name.substr(0, MAX_NAME_LEN);
+                name.resize(MAX_NAME_LEN, '\0');
+                out.write(name.data(), MAX_NAME_LEN);
+
+                struct tm tmbuf{};
+                std::time_t tt = std::time(nullptr);
+#if defined(_WIN32)
+                struct tm *tm = gmtime(&tt);
+                if (tm) tmbuf = *tm;
+#else
+                gmtime_r(&tt, &tmbuf);
+#endif
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_year + 1900));
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_mon + 1));
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_mday));
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_hour));
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_min));
+                write_u16_le(out, static_cast<uint16_t>(tmbuf.tm_sec));
+                write_u32_le(out, source[i].custom_data);
+            }
+        }
+    }
+
+    // final padding + truncate
+    out.seekp(0, std::ios::end);
+    uint32_t current_end = static_cast<uint32_t>(out.tellp());
+    if (current_end < eof) fill_zeroes(out, eof - current_end);
+
+    // ensure exact size (in case stream was larger from previous content)
+    // std::ofstream doesn't have setLength; we rely on the file being created fresh
+
+    out.close();
+    std::cout << "Created " << output_path << " (" << eof << " bytes, "
+              << entry_count << " entries)\n";
+    return true;
+}
+
+// ===================================================================
 // Show info
-// ---------------------------------------------------------------------------
+// ===================================================================
+
 static void show_info(const AFSArchive &afs) {
     std::cout << "\n";
     std::cout << " File name             : " << fs::path(afs.file_path).filename().string() << "\n";
@@ -325,30 +726,29 @@ static void show_info(const AFSArchive &afs) {
                       << std::setw(11) << "N/A" << " | "
                       << "N/A\n";
         } else {
-            std::string size_str = "0x";
-            {
-                std::ostringstream ss;
-                ss << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << e.size;
-                size_str += ss.str();
-            }
+            std::ostringstream ss;
+            ss << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << e.size;
+            std::string size_str = "0x" + ss.str();
+
             std::string cd_str = afs.has_attributes
                 ? ("0x" + ([] (uint32_t v) {
-                    std::ostringstream ss;
-                    ss << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << v;
-                    return ss.str();
+                    std::ostringstream s2;
+                    s2 << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << v;
+                    return s2.str();
                 }(e.custom_data)))
                 : "N/A";
-            std::string ts = afs.has_attributes
-                ? ([] (uint16_t y, uint16_t mo, uint16_t d, uint16_t h, uint16_t mi, uint16_t s) {
-                    std::ostringstream ss;
-                    ss << y << "/" << (mo < 10 ? "0" : "") << mo << "/"
-                       << (d < 10 ? "0" : "") << d << " "
-                       << (h < 10 ? "0" : "") << h << ":"
-                       << (mi < 10 ? "0" : "") << mi << ":"
-                       << (s < 10 ? "0" : "") << s;
-                    return ss.str();
-                }(e.year, e.month, e.day, e.hour, e.min, e.sec))
-                : "N/A";
+
+            std::string ts = "N/A";
+            if (afs.has_attributes) {
+                std::ostringstream s3;
+                s3 << e.year << "/"
+                   << std::setw(2) << std::setfill('0') << e.month << "/"
+                   << std::setw(2) << std::setfill('0') << e.day << " "
+                   << std::setw(2) << std::setfill('0') << e.hour << ":"
+                   << std::setw(2) << std::setfill('0') << e.min << ":"
+                   << std::setw(2) << std::setfill('0') << e.sec;
+                ts = s3.str();
+            }
 
             std::string name_disp = afs.has_attributes ? e.name : "N/A";
             if (name_disp.length() > 32) name_disp = name_disp.substr(0, 32);
@@ -364,17 +764,19 @@ static void show_info(const AFSArchive &afs) {
     std::cout << std::right;
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 // Usage
-// ---------------------------------------------------------------------------
+// ===================================================================
+
 static void usage(const char *prog) {
-    std::cout << "\nAFS CLI - AFS archive unpacker (C++ port)\n\n";
+    std::cout << "\nAFS CLI - AFS archive packer / unpacker\n\n";
     std::cout << "Usage:\n\n";
     std::cout << "  " << prog << " -e <input.afs> <output_dir>   Extract AFS archive\n";
-    std::cout << "  " << prog << " -i <input.afs>                  Show AFS information\n\n";
+    std::cout << "  " << prog << " -c <input_dir> <output.afs>   Create AFS archive\n";
+    std::cout << "  " << prog << " -i <input.afs>                 Show AFS information\n\n";
 }
 
-// ---------------------------------------------------------------------------
+// ===================================================================
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         usage(argv[0]);
@@ -392,6 +794,12 @@ int main(int argc, char *argv[]) {
         if (!extract_all(afs, output)) return 1;
 
         save_metadata(afs, output + ".json");
+
+    } else if (mode == "-c") {
+        if (argc != 4) { usage(argv[0]); return 1; }
+        std::string input(argv[2]), output(argv[3]);
+
+        if (!create_afs(input, output)) return 1;
 
     } else if (mode == "-i") {
         if (argc != 3) { usage(argv[0]); return 1; }
