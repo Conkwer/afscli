@@ -490,7 +490,7 @@ static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
             name = idx;
             if (detect) {
                 f.seekg(e.offset);
-                peek_buf.resize(std::min(e.size, 256u));
+                peek_buf.resize(std::min(e.size, 8192u));
                 f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
                 name += detect_extension(peek_buf);
             }
@@ -508,7 +508,7 @@ static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
                 }
             }
             f.seekg(e.offset);
-            peek_buf.resize(std::min(e.size, 256u));
+            peek_buf.resize(std::min(e.size, 8192u));
             f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
             name = std::string(idx) + detect_extension(peek_buf);
 
