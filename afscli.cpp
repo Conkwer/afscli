@@ -349,23 +349,35 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
     uint32_t attr_size   = read_le<uint32_t>(f);
     uint64_t file_size   = fs::file_size(path);
 
-    auto is_valid_attr = [&]() -> bool {
+    // Try to validate the TOC. Standard is 48-byte per entry; some in-house
+    // studio pipelines stripped the 16-byte metadata, producing 32-byte entries.
+    // The strides are mathematically exclusive: 48N / 32 ≠ M for any N, so
+    // there's no ambiguity — checking 48 first always picks the right one.
+    uint32_t toc_stride = 0;
+    auto try_validate_toc = [&](uint32_t stride) -> bool {
         if (attr_offset == 0 || attr_size == 0) return false;
-        if (attr_size < afs.entry_count * ATTR_ELEM_SZ) return false;
+        if (attr_size % stride != 0) return false;
+        if (attr_size / stride != afs.entry_count) return false;
         if (attr_size > file_size - last_end) return false;
         if (attr_offset < last_end) return false;
         if (attr_offset > file_size - attr_size) return false;
         return true;
     };
 
-    if (is_valid_attr()) {
+    auto locate_toc = [&]() -> bool {
+        if (try_validate_toc(ATTR_ELEM_SZ)) { toc_stride = ATTR_ELEM_SZ; return true; }
+        if (try_validate_toc(32))           { toc_stride = 32; return true; }
+        return false;
+    };
+
+    if (locate_toc()) {
         afs.has_attributes = true;
         afs.attr_info_label = "InfoAtBeginning";
     } else {
         f.seekg(first_offset - ATTR_INFO_SZ);
         attr_offset = read_le<uint32_t>(f);
         attr_size   = read_le<uint32_t>(f);
-        if (is_valid_attr()) {
+        if (locate_toc()) {
             afs.has_attributes = true;
             afs.attr_info_label = "InfoAtEnd";
         }
@@ -380,16 +392,18 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
         for (uint32_t i = 0; i < afs.entry_count; ++i) {
             auto &e = afs.entries[i];
             if (!e.is_null) {
-                e.name  = null_terminated(p, MAX_NAME_LEN);
-                e.year  = read_u16_le(p + 32);
-                e.month = read_u16_le(p + 34);
-                e.day   = read_u16_le(p + 36);
-                e.hour  = read_u16_le(p + 38);
-                e.min   = read_u16_le(p + 40);
-                e.sec   = read_u16_le(p + 42);
-                e.custom_data = read_u32_le(p + 44);
+                e.name = null_terminated(p, MAX_NAME_LEN);
+                if (toc_stride == ATTR_ELEM_SZ) {
+                    e.year  = read_u16_le(p + 32);
+                    e.month = read_u16_le(p + 34);
+                    e.day   = read_u16_le(p + 36);
+                    e.hour  = read_u16_le(p + 38);
+                    e.min   = read_u16_le(p + 40);
+                    e.sec   = read_u16_le(p + 42);
+                    e.custom_data = read_u32_le(p + 44);
+                }
             }
-            p += ATTR_ELEM_SZ;
+            p += toc_stride;
         }
     } else {
         for (uint32_t i = 0; i < afs.entry_count; ++i) {
