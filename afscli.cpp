@@ -462,6 +462,8 @@ static const char *detect_extension(const std::vector<uint8_t> &data) {
 
 static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
                         bool numbered, bool detect) {
+    // numbered=true → -n: force positional numbering, ignore TOC names
+    // numbered=false → -t (default): prefer TOC names when available
     std::ifstream f(afs.file_path, std::ios::binary);
     if (!f) return false;
 
@@ -477,11 +479,21 @@ static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
 
         if (e.is_null) {
             name = "_NULL_";
-        } else if (numbered && !detect) {
-            // -n alone: ALL files → bare NNNNNNNN
+        } else if (!numbered && afs.has_attributes && !e.name.empty()) {
+            // -t (default): use TOC filename
+            name = sanitize_name(e.name);
+
+        } else if (!numbered) {
+            // -t, no TOC name
             char idx[16];
             snprintf(idx, sizeof(idx), "%08u", i);
             name = idx;
+            if (detect) {
+                f.seekg(e.offset);
+                peek_buf.resize(std::min(e.size, 256u));
+                f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
+                name += detect_extension(peek_buf);
+            }
 
         } else if (numbered && detect) {
             // -n -d: ALL files → NNNNNNNN + extension
@@ -500,19 +512,8 @@ static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
             f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
             name = std::string(idx) + detect_extension(peek_buf);
 
-        } else if (afs.has_attributes && !e.name.empty()) {
-            // Default + -d: use TOC name
-            name = sanitize_name(e.name);
-        } else if (detect) {
-            // -d, no TOC name: NNNNNNNN + magic extension
-            char idx[16];
-            snprintf(idx, sizeof(idx), "%08u", i);
-            f.seekg(e.offset);
-            peek_buf.resize(std::min(e.size, 256u));
-            f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
-            name = std::string(idx) + detect_extension(peek_buf);
         } else {
-            // Default, no TOC: bare NNNNNNNN
+            // -n alone: ALL files → bare NNNNNNNN
             char idx[16];
             snprintf(idx, sizeof(idx), "%08u", i);
             name = idx;
@@ -882,8 +883,10 @@ static void show_info(const AFSArchive &afs) {
 static void usage(const char *prog) {
     std::cout << "\nAFS CLI - AFS archive packer / unpacker\n\n";
     std::cout << "Usage:\n\n";
-    std::cout << "  " << prog << " -e <input.afs> <output_dir>   Extract AFS archive\n";
+    std::cout << "  " << prog << " -e <input.afs> <output_dir>   Extract (use TOC names, default)\n";
     std::cout << "  " << prog << " -e -d <input.afs> <output_dir> Extract, detect types for nameless\n";
+    std::cout << "  " << prog << " -e -t <input.afs> <output_dir> Extract, force TOC filenames\n";
+    std::cout << "  " << prog << " -e -t -d <input.afs> <output>  Extract, TOC names + detect fallback\n";
     std::cout << "  " << prog << " -e -n <input.afs> <output_dir> Extract, number all filenames\n";
     std::cout << "  " << prog << " -e -n -d <input.afs> <output>  Extract, numbered + type detection\n";
     std::cout << "  " << prog << " -c <input_dir> <output.afs>   Create AFS archive\n";
@@ -904,6 +907,7 @@ int main(int argc, char *argv[]) {
         std::string input, output;
         for (int i = 2; i < argc; ++i) {
             if (std::strcmp(argv[i], "-n") == 0)      { numbered = true; }
+            else if (std::strcmp(argv[i], "-t") == 0) { numbered = false; }
             else if (std::strcmp(argv[i], "-d") == 0) { detect = true; }
             else if (input.empty())  { input = argv[i]; }
             else if (output.empty()) { output = argv[i]; }
