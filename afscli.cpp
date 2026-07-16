@@ -55,6 +55,14 @@ static void write_u16_le(std::ostream &out, uint16_t v) {
     out.put(static_cast<unsigned char>((v >> 8) & 0xFF));
 }
 
+static std::string strip_trailing_sep(const std::string &path) {
+    if (path.empty()) return path;
+    std::string s = path;
+    while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
+        s.pop_back();
+    return s;
+}
+
 static uint32_t pad(uint32_t v, uint32_t align) {
     uint32_t mod = v % align;
     return mod ? v + (align - mod) : v;
@@ -492,7 +500,7 @@ static void save_metadata(const AFSArchive &afs, const std::string &meta_path) {
 // ===================================================================
 
 static bool create_afs(const std::string &input_dir, const std::string &output_path) {
-    std::string meta_path = input_dir + ".json";
+    std::string meta_path = strip_trailing_sep(input_dir) + ".json";
     std::vector<SourceEntry> source;
     std::string magic_label = "AFS_00";
     std::string attr_mode   = "InfoAtBeginning";
@@ -793,7 +801,7 @@ int main(int argc, char *argv[]) {
         if (!load_afs(input, afs)) return 1;
         if (!extract_all(afs, output)) return 1;
 
-        save_metadata(afs, output + ".json");
+        save_metadata(afs, strip_trailing_sep(output) + ".json");
 
     } else if (mode == "-c") {
         if (argc != 4) { usage(argv[0]); return 1; }
