@@ -279,6 +279,31 @@ static std::string null_terminated(const uint8_t *buf, size_t maxlen) {
     return std::string(reinterpret_cast<const char *>(buf), len);
 }
 
+static int natural_compare(const std::string &a, const std::string &b) {
+    size_t ia = 0, ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+        if (isdigit(static_cast<unsigned char>(a[ia])) &&
+            isdigit(static_cast<unsigned char>(b[ib]))) {
+            // Skip leading zeros
+            while (ia < a.size() && a[ia] == '0') ++ia;
+            while (ib < b.size() && b[ib] == '0') ++ib;
+            size_t sa = ia, sb = ib;
+            while (ia < a.size() && isdigit(static_cast<unsigned char>(a[ia]))) ++ia;
+            while (ib < b.size() && isdigit(static_cast<unsigned char>(b[ib]))) ++ib;
+            size_t la = ia - sa, lb = ib - sb;
+            if (la != lb) return la < lb ? -1 : 1;
+            for (size_t j = 0; j < la; ++j) {
+                if (a[sa + j] != b[sb + j]) return a[sa + j] < b[sb + j] ? -1 : 1;
+            }
+        } else {
+            if (a[ia] != b[ib]) return a[ia] < b[ib] ? -1 : 1;
+            ++ia; ++ib;
+        }
+    }
+    return ia >= a.size() && ib < b.size() ? -1 :
+           ib >= b.size() && ia < a.size() ? 1 : 0;
+}
+
 static std::string sanitize_name(const std::string &raw) {
     if (raw.empty()) return "_NO_NAME";
     std::string out;
@@ -351,8 +376,8 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
 
     auto is_valid_attr = [&]() -> bool {
         if (attr_offset == 0 || attr_size == 0) return false;
-        if (attr_size > file_size - last_end) return false;
         if (attr_size < afs.entry_count * ATTR_ELEM_SZ) return false;
+        if (attr_size > file_size - last_end) return false;
         if (attr_offset < last_end) return false;
         if (attr_offset > file_size - attr_size) return false;
         return true;
@@ -552,7 +577,9 @@ static bool create_afs(const std::string &input_dir, const std::string &output_p
         for (const auto &de : fs::directory_iterator(input_dir)) {
             if (de.is_regular_file()) files.push_back(de.path());
         }
-        std::sort(files.begin(), files.end());
+        std::sort(files.begin(), files.end(), [](const fs::path &pa, const fs::path &pb) {
+            return natural_compare(pa.filename().string(), pb.filename().string()) < 0;
+        });
         for (const auto &fp : files) {
             SourceEntry se;
             se.file_name = fp.filename().string();
