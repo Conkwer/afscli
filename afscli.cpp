@@ -417,11 +417,11 @@ static bool load_afs(const std::string &path, AFSArchive &afs) {
 }
 
 // ===================================================================
-// Magic-based extension detection for CRI formats
+// Magic-based extension detection for Dreamcast/CRI formats
 // ===================================================================
 
 static const char *detect_extension(const std::vector<uint8_t> &data) {
-    // ADX: big-endian 0x8000 at offset 0
+    // ADX: big-endian 0x8000 at offset 0 + "(c)CRI" signature
     if (data.size() >= 24 &&
         data[0] == 0x80 && data[1] == 0x00) {
         uint16_t copr_off = (static_cast<uint16_t>(data[2]) << 8) | data[3];
@@ -433,11 +433,26 @@ static const char *detect_extension(const std::vector<uint8_t> &data) {
     // AHX: "AHX(" at offset 0
     if (data.size() >= 4 && std::memcmp(data.data(), "AHX(", 4) == 0)
         return ".ahx";
-    // SFD (Sofdec): MPEG-PS start code
+    // SFD (Sofdec): MPEG-PS start code 00 00 01 BA
     if (data.size() >= 4 &&
         data[0] == 0x00 && data[1] == 0x00 &&
         data[2] == 0x01 && data[3] == 0xBA)
         return ".sfd";
+    // PVR: optional GBIX header, then "PVRT" chunk (Dreamcast little-endian)
+    if (data.size() >= 16) {
+        size_t pvrt_off = 0;
+        if (std::memcmp(data.data(), "GBIX", 4) == 0) {
+            uint32_t gbix_sz = data[4] | (static_cast<uint32_t>(data[5]) << 8) |
+                               (static_cast<uint32_t>(data[6]) << 16) |
+                               (static_cast<uint32_t>(data[7]) << 24);
+            if (data.size() >= 8 + gbix_sz + 16)
+                pvrt_off = 8 + gbix_sz;
+            else
+                return ".bin";
+        }
+        if (std::memcmp(&data[pvrt_off], "PVRT", 4) == 0)
+            return ".pvr";
+    }
     return ".bin";
 }
 
@@ -445,66 +460,65 @@ static const char *detect_extension(const std::vector<uint8_t> &data) {
 // Extract all entries
 // ===================================================================
 
-static bool extract_all(const AFSArchive &afs, const std::string &out_dir, bool numbered) {
+static bool extract_all(const AFSArchive &afs, const std::string &out_dir,
+                        bool numbered, bool detect) {
     std::ifstream f(afs.file_path, std::ios::binary);
     if (!f) return false;
 
     fs::create_directories(out_dir);
 
     std::vector<uint8_t> peek_buf;
-
     std::vector<std::string> out_names;
     out_names.reserve(afs.entry_count);
+
     for (uint32_t i = 0; i < afs.entry_count; ++i) {
         const auto &e = afs.entries[i];
         std::string name;
 
         if (e.is_null) {
             name = "_NULL_";
-        } else if (numbered) {
-            // Force position-based naming: NNNNNNNN + detected/source extension
+        } else if (numbered && !detect) {
+            // -n alone: ALL files → bare NNNNNNNN
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%08u", i);
+            name = idx;
+
+        } else if (numbered && detect) {
+            // -n -d: ALL files → NNNNNNNN + extension
             char idx[16];
             snprintf(idx, sizeof(idx), "%08u", i);
 
-            // Read first bytes for detection
-            f.seekg(e.offset);
-            peek_buf.resize(std::min(e.size, 256u));
-            f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
-
-            const char *ext = detect_extension(peek_buf);
-
-            // If TOC had a name, prefer its extension over detection
             if (afs.has_attributes && !e.name.empty()) {
                 auto dot = e.name.rfind('.');
-                if (dot != std::string::npos && dot + 1 < e.name.size())
-                    ext = nullptr;  // use TOC extension below
+                if (dot != std::string::npos && dot + 1 < e.name.size()) {
+                    name = std::string(idx) + e.name.substr(dot);
+                    goto dedup;
+                }
             }
-
-            name = idx;
-            if (ext) {
-                name += ext;
-            } else {
-                // Use extension from TOC name
-                auto dot = e.name.rfind('.');
-                name += e.name.substr(dot);
-            }
-        } else if (afs.has_attributes && !e.name.empty()) {
-            // Use TOC name (current behavior)
-            name = sanitize_name(e.name);
-        } else {
-            // No TOC name: NNNNNNNN + detected ext or .bin
-            char idx[16];
-            snprintf(idx, sizeof(idx), "%08u", i);
-            name = idx;
-
             f.seekg(e.offset);
             peek_buf.resize(std::min(e.size, 256u));
             f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
+            name = std::string(idx) + detect_extension(peek_buf);
 
-            name += detect_extension(peek_buf);
+        } else if (afs.has_attributes && !e.name.empty()) {
+            // Default + -d: use TOC name
+            name = sanitize_name(e.name);
+        } else if (detect) {
+            // -d, no TOC name: NNNNNNNN + magic extension
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%08u", i);
+            f.seekg(e.offset);
+            peek_buf.resize(std::min(e.size, 256u));
+            f.read(reinterpret_cast<char *>(peek_buf.data()), peek_buf.size());
+            name = std::string(idx) + detect_extension(peek_buf);
+        } else {
+            // Default, no TOC: bare NNNNNNNN
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%08u", i);
+            name = idx;
         }
 
-        // deduplicate
+    dedup:
         uint32_t dup = 0;
         for (const auto &prev : out_names) {
             if (prev == name) ++dup;
@@ -869,7 +883,9 @@ static void usage(const char *prog) {
     std::cout << "\nAFS CLI - AFS archive packer / unpacker\n\n";
     std::cout << "Usage:\n\n";
     std::cout << "  " << prog << " -e <input.afs> <output_dir>   Extract AFS archive\n";
+    std::cout << "  " << prog << " -e -d <input.afs> <output_dir> Extract, detect types for nameless\n";
     std::cout << "  " << prog << " -e -n <input.afs> <output_dir> Extract, number all filenames\n";
+    std::cout << "  " << prog << " -e -n -d <input.afs> <output>  Extract, numbered + type detection\n";
     std::cout << "  " << prog << " -c <input_dir> <output.afs>   Create AFS archive\n";
     std::cout << "  " << prog << " -i <input.afs>                 Show AFS information\n\n";
 }
@@ -884,18 +900,19 @@ int main(int argc, char *argv[]) {
     std::string mode(argv[1]);
 
     if (mode == "-e") {
-        bool numbered = false;
+        bool numbered = false, detect = false;
         std::string input, output;
         for (int i = 2; i < argc; ++i) {
-            if (std::strcmp(argv[i], "-n") == 0) { numbered = true; }
-            else if (input.empty()) { input = argv[i]; }
+            if (std::strcmp(argv[i], "-n") == 0)      { numbered = true; }
+            else if (std::strcmp(argv[i], "-d") == 0) { detect = true; }
+            else if (input.empty())  { input = argv[i]; }
             else if (output.empty()) { output = argv[i]; }
         }
         if (input.empty() || output.empty()) { usage(argv[0]); return 1; }
 
         AFSArchive afs;
         if (!load_afs(input, afs)) return 1;
-        if (!extract_all(afs, output, numbered)) return 1;
+        if (!extract_all(afs, output, numbered, detect)) return 1;
 
         save_metadata(afs, strip_trailing_sep(output) + ".json");
 
