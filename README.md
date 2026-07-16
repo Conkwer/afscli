@@ -73,3 +73,7 @@ aarch64-linux-gnu-g++ -std=c++17 -O2 -Wall -Wextra -static -o afscli-arm64 afscl
 ```
 
 Prebuilt binaries for all three platforms are included in the repo.
+
+## Credits
+
+Thanks to [MaikelChan](https://github.com/MaikelChan) and [AFSPacker](https://github.com/MaikelChan/AFSPacker) for early reference and ideas.
