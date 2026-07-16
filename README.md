@@ -15,10 +15,10 @@ Extracts all entries to `output/` and saves metadata to `output.json`.
 
 | Flags | Has TOC name | No TOC name |
 |---|---|---|
-| `-e` / `-e -t` (default) | `01JUCE.SRF` | `00000000` |
-| `-e -d` / `-e -t -d` | `01JUCE.SRF` | `00000000.adx` |
+| `-e` / `-e -t` (default) | `01JUCE.EXT` | `00000000` |
+| `-e -d` / `-e -t -d` | `01JUCE.EXT` | `00000000.adx` |
 | `-e -n` | `00000000` | `00000000` |
-| `-e -n -d` | `00000000.SRF` | `00000000.adx` |
+| `-e -n -d` | `00000000.EXT` | `00000000.adx` |
 
 - **`-t`, `--toc`** — use TOC filenames when available (default behavior)
 - **`-n`, `--numbered`** — force positional numbering for all files
