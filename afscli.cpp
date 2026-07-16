@@ -883,14 +883,22 @@ static void show_info(const AFSArchive &afs) {
 static void usage(const char *prog) {
     std::cout << "\nAFS CLI - AFS archive packer / unpacker\n\n";
     std::cout << "Usage:\n\n";
-    std::cout << "  " << prog << " -e <input.afs> <output_dir>   Extract (use TOC names, default)\n";
-    std::cout << "  " << prog << " -e -d <input.afs> <output_dir> Extract, detect types for nameless\n";
-    std::cout << "  " << prog << " -e -t <input.afs> <output_dir> Extract, force TOC filenames\n";
-    std::cout << "  " << prog << " -e -t -d <input.afs> <output>  Extract, TOC names + detect fallback\n";
-    std::cout << "  " << prog << " -e -n <input.afs> <output_dir> Extract, number all filenames\n";
-    std::cout << "  " << prog << " -e -n -d <input.afs> <output>  Extract, numbered + type detection\n";
-    std::cout << "  " << prog << " -c <input_dir> <output.afs>   Create AFS archive\n";
-    std::cout << "  " << prog << " -i <input.afs>                 Show AFS information\n\n";
+    std::cout << "  " << prog << " -e, --extract <in> <out>        Extract (TOC names, default)\n";
+    std::cout << "  " << prog << " -e -d, --detect <in> <out>       Extract, detect types for nameless\n";
+    std::cout << "  " << prog << " -e -t, --toc <in> <out>          Extract, force TOC filenames\n";
+    std::cout << "  " << prog << " -e -t -d <in> <out>              TOC names + detect fallback\n";
+    std::cout << "  " << prog << " -e -n, --numbered <in> <out>     Extract, number all filenames\n";
+    std::cout << "  " << prog << " -e -n -d <in> <out>              Numbered + type detection\n";
+    std::cout << "  " << prog << " -c, --create <dir> <out.afs>     Create AFS archive\n";
+    std::cout << "  " << prog << " -i, --info <input.afs>           Show AFS information\n\n";
+}
+
+// ===================================================================
+// Simple flag matcher: supports both short (-x) and long (--long) forms
+// ===================================================================
+
+static bool is_flag(const char *arg, const char *short_name, const char *long_name) {
+    return std::strcmp(arg, short_name) == 0 || std::strcmp(arg, long_name) == 0;
 }
 
 // ===================================================================
@@ -902,13 +910,13 @@ int main(int argc, char *argv[]) {
 
     std::string mode(argv[1]);
 
-    if (mode == "-e") {
+    if (mode == "-e" || mode == "--extract") {
         bool numbered = false, detect = false;
         std::string input, output;
         for (int i = 2; i < argc; ++i) {
-            if (std::strcmp(argv[i], "-n") == 0)      { numbered = true; }
-            else if (std::strcmp(argv[i], "-t") == 0) { numbered = false; }
-            else if (std::strcmp(argv[i], "-d") == 0) { detect = true; }
+            if (is_flag(argv[i], "-n", "--numbered"))      { numbered = true; }
+            else if (is_flag(argv[i], "-t", "--toc"))      { numbered = false; }
+            else if (is_flag(argv[i], "-d", "--detect"))   { detect = true; }
             else if (input.empty())  { input = argv[i]; }
             else if (output.empty()) { output = argv[i]; }
         }
@@ -920,13 +928,13 @@ int main(int argc, char *argv[]) {
 
         save_metadata(afs, strip_trailing_sep(output) + ".json");
 
-    } else if (mode == "-c") {
+    } else if (mode == "-c" || mode == "--create") {
         if (argc != 4) { usage(argv[0]); return 1; }
         std::string input(argv[2]), output(argv[3]);
 
         if (!create_afs(input, output)) return 1;
 
-    } else if (mode == "-i") {
+    } else if (mode == "-i" || mode == "--info") {
         if (argc != 3) { usage(argv[0]); return 1; }
         std::string input(argv[2]);
 
